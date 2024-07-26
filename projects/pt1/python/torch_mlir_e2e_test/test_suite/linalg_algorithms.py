@@ -91,3 +91,40 @@ class SignAndLogarithmOfDeterminantDynamicModule(torch.nn.Module):
 def SignAndLogarithmOfDeterminantDynamicModule_F32(module, tu: TestUtils):
     A = tu.rand(3, 4, 4).to(dtype=torch.float32)
     module.forward(A)
+
+
+# ==============================================================================
+
+
+class LinalgCholeskyExModule(torch.nn.Module):
+    @export
+    @annotate_args([None, [(4, 4), torch.float32, True]])
+    def forward(self, A):
+        return torch.aten.linalg.cholesky_ex(A)
+
+
+@register_test_case(module_factory=lambda: LinalgCholeskyExModule())
+def LinalgCholeskyExModule_F32(module, tu: TestUtils):
+    A = tu.rand(4, 4, dtype=torch.complex64)
+    A = A @ A.t().conj()
+    module.forward(A)
+
+
+# ==============================================================================
+
+
+class LinalgCholeskyExComplexModule(torch.nn.Module):
+    @export
+    @annotate_args([None, [(4, 4), torch.complex64, True]])
+    def forward(self, A):
+        return torch.aten.linalg.cholesky_ex(A)
+
+
+@register_test_case(module_factory=lambda: LinalgCholeskyExComplexModule())
+def LinalgCholeskyExComplexModule_C64(module, tu: TestUtils):
+    A = tu.rand(4, 4, dtype=torch.complex64)
+    A = A @ A.t().conj()
+    module.forward(A)
+
+
+# TODO: ADD MORE CHOLESKY TESTS

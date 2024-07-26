@@ -256,6 +256,12 @@ def aten〇linalg_slogdet〡shape(A: List[int]) -> Tuple[List[int], List[int]]:
     shape = upstream_shape_functions.zero_dim_tensor(A)
     return shape, shape
 
+def aten〇linalg_cholesky_ex〡shape(self: List[int], upper: bool = False, check_errors: bool = False) -> Tuple[List[int], List[int]]:
+    assert len(self) >= 2
+    assert self[-1] == self[-2]
+    # (decompositions, LAPACK error codes)
+    return (self, self[:-2])
+
 def aten〇detach〡shape(self: List[int]) -> List[int]:
     return upstream_shape_functions.unary(self)
 
@@ -2799,6 +2805,12 @@ def aten〇cumsum〡dtype(self_rank_dtype: Tuple[int, int], dim: int, dtype: Opt
     if is_integer_dtype(self_dtype):
         return torch.int64
     return self_dtype
+
+@check_dtype_function(_check_tensors_with_the_same_dtype(tensor_shapes=[(4,4),], error_types={*all_integer_dtypes()}))
+def aten〇linalg_cholesky_ex〡dtype(self_rank_dtype: Tuple[int, int], upper: bool = False, check_errors: bool = False) -> Tuple[int, int]:
+    self_rank, self_dtype = self_rank_dtype
+    assert not is_integer_dtype(self_dtype)
+    return (self_dtype, torch.int32)
 
 @check_dtype_function(_check_tensors_with_the_same_dtype(num_of_tensors=1))
 def aten〇detach〡dtype(self_rank_dtype: Tuple[int, int]) -> int:

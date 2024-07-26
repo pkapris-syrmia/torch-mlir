@@ -8747,6 +8747,32 @@ def Torch_AtenLinalgQrOp : Torch_Op<"aten.linalg_qr", [
   }];
 }
 
+def Torch_AtenLinalgCholeskyExOp : Torch_Op<"aten.linalg_cholesky_ex", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Generated op for `aten::linalg_cholesky_ex : (Tensor, bool, bool) -> (Tensor, Tensor)`";
+  let arguments = (ins
+    AnyTorchTensorType:$self,
+    Torch_BoolType:$upper,
+    Torch_BoolType:$check_errors
+  );
+  let results = (outs
+    AnyTorchOptionalTensorType:$L,
+    AnyTorchOptionalTensorType:$info
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult AtenLinalgCholeskyExOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 3, 2);
+    }
+    void AtenLinalgCholeskyExOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 3, 2);
+    }
+  }];
+}
+
 def Torch_AtenLinalgDetOp : Torch_Op<"aten.linalg_det", [
     AllowsTypeRefinement,
     HasValueSemantics,

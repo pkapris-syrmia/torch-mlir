@@ -7,6 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "torch-mlir/Conversion/TorchToLinalg/TorchToLinalg.h"
 
 #include "PopulatePatterns.h"
@@ -2954,10 +2955,266 @@ public:
 };
 } // namespace
 
+// Implements lowering for torch.aten.cholesky_ex, using the following simple
+// algorithm for cholesky decomposittion:
+// Input: matrix A[n,n]
+// Output: matrix L[n,n], starts out with all zeros
+// Alg:
+// for i=0..n:
+//   L[i,i] = sqrt(A[i,i] - dot(L[i,0:i-1],L[i,0:i-1]))
+//   L[i+1:,i] = A[i+1:,i] - matmul(L[i+1:, 0:i-1], trans(conj(L[i,0:i-1])))
+//
+// Here matmul is matrix multiplication, trans is transposition and conj is the
+// complex conjugate operation, applied elementwise to the vector
+
+// The algorithm was adapted from the second codeblock in this page section:
+// https://en.wikipedia.org/wiki/Cholesky_decomposition#The_Cholesky%E2%80%93Banachiewicz_and_Cholesky%E2%80%93Crout_algorithms
+// Although it should be noted the matrix multiplication is different here
+// compared to the article, not sure if there is a mistake in the article or if
+// that line is some quirk of Fortran's syntax, but the changed code above
+// should be correct
+namespace {
+class ConvertAtenLinalgCholeskyExOp
+    : public OpConversionPattern<AtenLinalgCholeskyExOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenLinalgCholeskyExOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *context = op->getContext();
+    Value input = adaptor.getSelf();
+
+    auto inputType = cast<RankedTensorType>(input.getType());
+    unsigned inputRank = inputType.getRank();
+    SmallVector<Value> inputSizes = getTensorSizes(rewriter, loc, input);
+    Type elemTy = inputType.getElementType();
+
+    Value cstZero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value cstOne = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value cstZeroF = getConstant(rewriter, loc, 0, elemTy);
+    OpFoldResult cstOneFold = getAsOpFoldResult(cstOne);
+    OpFoldResult cstZeroFold = getAsOpFoldResult(cstZero);
+
+    Value matDim = inputSizes[inputRank - 1];
+    Value matDimMinusOne = rewriter.create<arith::SubIOp>(loc, matDim, cstOne);
+
+    // Original L, uninitialized.
+    Value lEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, getAsOpFoldResult(inputSizes), elemTy);
+    Value l0 = rewriter
+                   .create<linalg::FillOp>(loc, /*ins=*/ValueRange{cstZero},
+                                           /*outs=*/ValueRange{lEmpty})
+                   .getResult(0);
+    auto generateLLoop = rewriter.create<scf::ForOp>(
+        loc, /*start=*/cstZero, /*end=*/matDimMinusOne, /*step=*/cstOne,
+        /*yield_to=*/ValueRange{l0}, /*body_lambda=*/
+        [&](OpBuilder &b, Location loc, /*index*/ Value colIndex,
+            /*iter_args*/ ValueRange vals) {
+          // Here iter_args will only contain the matrix L which we wish to
+          // modify in each loop
+          SmallVector<OpFoldResult> colDims = {cstOneFold, matDim};
+          Value col0 = rewriter.create<tensor::EmptyOp>(
+              loc, getAsOpFoldResult(inputSizes), elemTy);
+
+          SmallVector<OpFoldResult> offsets(inputRank, cstZeroFold);
+        });
+    bool isBatched = (inputRank == 3);
+    // get some shapes
+    SmallVector<int64_t> inputShape(inputType.getShape());
+    SmallVector<int64_t> sliceShape(inputShape);
+    sliceShape.pop_back();
+    SmallVector<int64_t> diagShape({isBatched ? inputType.getShape()[0] : 1});
+    auto sliceTy = RankedTensorType::get(sliceShape, elemTy);
+    auto diagTy = RankedTensorType::get(diagShape, elemTy);
+    // get some sizes
+    ///////// SmallVector<Value> inputSizes = getTensorSizes(rewriter, loc,
+    /// input);
+    Value chDim = isBatched ? inputSizes[0] : cstOne;
+    ArrayRef<Value> sliceSizes(inputSizes.begin(), inputSizes.end() - 1);
+    // initialize a tensor to store the diagonal elements found during row
+    // reduction
+    Value initDiags = rewriter.create<tensor::EmptyOp>(
+        loc, getAsOpFoldResult(sliceSizes), elemTy);
+    // loop over each pivot row in A. Get the diagonal, then reduce the
+    // subdiagonal Don't perform the loop on the last row since no further
+    // reduction is needed.
+    auto rowReductionLoop = rewriter.create<scf::ForOp>(
+        loc, /*start=*/cstZero, /*end=*/matDimMinusOne, /*step=*/cstOne,
+        /*yeild_to=*/ValueRange{input, initDiags}, /*body_lambda=*/
+        [&](OpBuilder &b, Location loc, Value row, ValueRange vals) {
+          // extract row i from input Tensor of shape CxNxN or shape
+          // NxN.
+          OpFoldResult cstOneFold = getAsOpFoldResult(cstOne);
+          OpFoldResult cstZeroFold = getAsOpFoldResult(cstZero);
+          SmallVector<OpFoldResult> offsets(inputRank, cstZeroFold);
+          offsets[inputRank - 2] = row;
+          SmallVector<OpFoldResult> strides(inputRank, cstOneFold);
+          auto sizes = getAsOpFoldResult(inputSizes);
+          sizes[inputRank - 2] = cstOneFold;
+          // offsets = [0, row, 0], sizes = [C, 1, N] -> pivot row
+          Value pivot = b.create<tensor::ExtractSliceOp>(
+              loc, sliceTy, vals[0], offsets, sizes, strides);
+          // extract diagonal elements and insert them into vals[1]
+          offsets.back() = row;
+          sizes.back() = cstOneFold;
+          // offsets = [0, row, row], sizes = [C, 1, 1] -> diag(row,row)
+          Value diag = b.create<tensor::ExtractSliceOp>(
+              loc, diagTy, vals[0], offsets, sizes, strides);
+          SmallVector<OpFoldResult> diagOffsets(inputRank - 1, cstZeroFold);
+          diagOffsets.back() = row;
+          SmallVector<OpFoldResult> diagStrides(inputRank - 1, cstOneFold);
+          SmallVector<OpFoldResult> diagSizes = getAsOpFoldResult(sliceSizes);
+          diagSizes.back() = cstOneFold;
+          // offsets = [0, row], sizes = [C, 1] insert to [C,N]
+          Value updatedDiags = b.create<tensor::InsertSliceOp>(
+              loc, diag, vals[1], diagOffsets, diagSizes, diagStrides);
+          // the subpivot matrix column size, as a Value, is matDim - row -
+          // cstOne. This can't be statically converted to an int64_t, since row
+          // is the loop index, so this is left as a dynamic dim.
+          SmallVector<int64_t> subPivotShape(inputType.getShape());
+          subPivotShape[inputRank - 2] = ShapedType::kDynamic;
+          ArrayRef<int64_t> subDiagShape(subPivotShape.begin(),
+                                         subPivotShape.end() - 1);
+          auto subPivotTy = RankedTensorType::get(subPivotShape, elemTy);
+          auto subDiagTy = RankedTensorType::get(subDiagShape, elemTy);
+          Value rowPlusOne = b.create<arith::AddIOp>(loc, row, cstOne);
+          offsets[inputRank - 2] = getAsOpFoldResult(rowPlusOne);
+          sizes[inputRank - 2] = getAsOpFoldResult(
+              b.create<arith::SubIOp>(loc, matDim, rowPlusOne));
+          // offsets = [0, row + 1, row], sizes = [C, N - row - 1, 1] -> A_j,row
+          // with j > row
+          Value subDiag = b.create<tensor::ExtractSliceOp>(
+              loc, subDiagTy, vals[0], offsets, sizes, strides);
+          offsets.back() = cstZeroFold;
+          sizes.back() = getAsOpFoldResult(matDim);
+          // offsets = [0, row + 1, 0], sizes = [C, N - row - 1, N] -> elements
+          // below pivot row
+          Value subPivot = b.create<tensor::ExtractSliceOp>(
+              loc, subPivotTy, vals[0], offsets, sizes, strides);
+          Value initResult = b.create<tensor::EmptyOp>(loc, sizes, elemTy);
+          // write a generic op to perform subpivot = subpivot -
+          // (subdiag/diag)*pivot
+          // d0 = batches, d1 = row, d2 = column -> pivot(d0,d2), diag(d0),
+          // subPivot(d0,d1,d2), subDiag(d0, d1); output(d0,d1,d2)
+          SmallVector<AffineExpr> allDims;
+          for (unsigned i = 0; i < inputRank; i++)
+            allDims.push_back(b.getAffineDimExpr(i));
+          SmallVector<AffineExpr> rowIterator(1, allDims[0]);
+          SmallVector<AffineExpr> colIterator;
+          SmallVector<AffineExpr> batchIterator;
+          if (isBatched) {
+            rowIterator.push_back(allDims[1]);
+            colIterator.push_back(allDims[0]);
+            colIterator.push_back(allDims[2]);
+            batchIterator.push_back(allDims[0]);
+          } else {
+            colIterator.push_back(allDims[1]);
+            batchIterator.push_back(getAffineConstantExpr(0, context));
+          }
+          SmallVector<AffineMap> indexingMaps;
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, colIterator, context));
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, batchIterator, context));
+          indexingMaps.push_back(b.getMultiDimIdentityMap(inputRank));
+          indexingMaps.push_back(
+              AffineMap::get(inputRank, 0, rowIterator, context));
+          indexingMaps.push_back(b.getMultiDimIdentityMap(inputRank));
+          SmallVector<utils::IteratorType> iteratorTypes(
+              inputRank, utils::IteratorType::parallel);
+          Value reducedSubPivot =
+              b.create<linalg::GenericOp>(
+                   loc, subPivotTy, ValueRange{pivot, diag, subPivot, subDiag},
+                   initResult, indexingMaps, iteratorTypes,
+                   [&](OpBuilder &b, Location loc, ValueRange args) {
+                     // for d0 in batches, d1 in subpivotrows, d2 in columns
+                     // let i represent the pivot row index (scf loop index)
+                     Value pivotd0d2 = args[0];
+                     Value diagd0 = args[1];
+                     Value subPivotd0d1d2 = args[2];
+                     Value subDiagd0d1 = args[3];
+                     // coeff = A_d1,i / A_i,i
+                     Value coeff =
+                         b.create<arith::DivFOp>(loc, subDiagd0d1, diagd0);
+                     auto cmp = b.create<arith::CmpFOp>(
+                         loc, arith::CmpFPredicate::ONE, diagd0, cstZeroF);
+                     b.create<cf::AssertOp>(
+                         loc, cmp,
+                         b.getStringAttr(
+                             "unimplemented: determinants requiring "
+                             "permutations and singular matrices"));
+                     // coeff*A_i,d2
+                     Value scaledPivotValue =
+                         b.create<arith::MulFOp>(loc, coeff, pivotd0d2);
+                     // result = A_d1,d2 - (A_d1,i/A_i,i)*A_i,d2
+                     // so that when d2 = i, A_d1,i - (A_d1,i/A_i,i) * A_i,i = 0
+                     Value result = b.create<arith::SubFOp>(loc, subPivotd0d1d2,
+                                                            scaledPivotValue);
+                     b.create<linalg::YieldOp>(loc, result);
+                   })
+                  .getResult(0);
+          Value rowReductionResult = b.create<tensor::InsertSliceOp>(
+              loc, reducedSubPivot, vals[0], offsets, sizes, strides);
+          b.create<scf::YieldOp>(loc,
+                                 ValueRange{rowReductionResult, updatedDiags});
+        });
+    Value allDiagsExceptLast = rowReductionLoop.getResult(1);
+    SmallVector<OpFoldResult> offsets(inputRank,
+                                      getAsOpFoldResult(matDimMinusOne));
+    SmallVector<OpFoldResult> strides(inputRank, getAsOpFoldResult(cstOne));
+    SmallVector<OpFoldResult> sizes(inputRank, getAsOpFoldResult(cstOne));
+    sizes[0] = getAsOpFoldResult(chDim);
+    if (isBatched)
+      offsets[0] = getAsOpFoldResult(cstZero);
+    Value lastDiag = rewriter.create<tensor::ExtractSliceOp>(
+        loc, diagTy, rowReductionLoop.getResult(0), offsets, sizes, strides);
+    offsets.pop_back();
+    strides.pop_back();
+    sizes.pop_back();
+    Value allDiags = rewriter.create<tensor::InsertSliceOp>(
+        loc, lastDiag, allDiagsExceptLast, offsets, sizes, strides);
+    // linalg generic to do reduce prod for allDiags along back dim.
+    // the result of that generic will be the determinant
+    SmallVector<AffineMap> indexingMaps;
+    indexingMaps.push_back(rewriter.getMultiDimIdentityMap(inputRank - 1));
+    AffineExpr resultExpr = isBatched ? rewriter.getAffineDimExpr(0)
+                                      : getAffineConstantExpr(0, context);
+    indexingMaps.push_back(AffineMap::get(inputRank - 1, 0, resultExpr));
+    SmallVector<utils::IteratorType> iteratorTypes(
+        inputRank - 1, utils::IteratorType::parallel);
+    Value initDet = createInitTensor(rewriter, loc, ValueRange{chDim}, elemTy,
+                                     getConstant(rewriter, loc, 1.0, elemTy));
+    Value determinant =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, initDet.getType(), ValueRange{allDiags}, initDet,
+                indexingMaps, iteratorTypes,
+                [&](OpBuilder &b, Location loc, ValueRange args) {
+                  Value prod = b.create<arith::MulFOp>(loc, args[0], args[1]);
+                  b.create<linalg::YieldOp>(loc, prod);
+                })
+            .getResult(0);
+    Type newResultType =
+        getTypeConverter()->convertType(op.getResult().getType());
+    if (isBatched) {
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType,
+                                                  determinant);
+      return success();
+    }
+    Value detVal = rewriter.create<tensor::ExtractOp>(
+        loc, determinant, SmallVector<Value>(1, cstZero));
+    rewriter.replaceOpWithNewOp<tensor::FromElementsOp>(op, newResultType,
+                                                        ValueRange{detVal});
+    return success();
+  }
+};
+} // namespace
+
 namespace {
 // This pattern row reduces a matrix, then returns the product of it's diagonal
 // elements
-class ConvertAtenLinalgDetOp : public OpConversionPattern<AtenLinalgDetOp> {
+class ConvertAtenEmptyinalgDetOp : public OpConversionPattern<AtenLinalgDetOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
   LogicalResult

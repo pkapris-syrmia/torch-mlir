@@ -713,6 +713,7 @@ def emit_ops(emitter_td: TextEmitter, registry: Registry):
     emit("aten::linalg_vector_norm : (Tensor, Scalar, int[]?, bool, int?) -> (Tensor)")
     emit("aten::linalg_norm : (Tensor, Scalar?, int[]?, bool, int?) -> (Tensor)")
     emit("aten::linalg_qr : (Tensor, str) -> (Tensor, Tensor)")
+    emit("aten::linalg_cholesky_ex : (Tensor, bool, bool) -> (Tensor, Tensor)")
     emit("aten::linalg_det : (Tensor) -> (Tensor)")
     emit("aten::_linalg_det : (Tensor) -> (Tensor, Tensor, Tensor)")
     emit("aten::linalg_slogdet : (Tensor) -> (Tensor, Tensor)")
