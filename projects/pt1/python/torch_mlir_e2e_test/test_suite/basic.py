@@ -819,6 +819,29 @@ def TransposeIntModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class AdjointRealModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([3, 4, 2], torch.float32, True),
+        ]
+    )
+    def forward(self, x):
+        return torch.transpose(x, 0, 1)
+
+
+@register_test_case(module_factory=lambda: TransposeIntModule())
+def TransposeIntModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(3, 4, 2))
+
+
+# ==============================================================================
+
+
 class PermuteModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
