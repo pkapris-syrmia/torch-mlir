@@ -834,8 +834,8 @@ class AdjointRealModule(torch.nn.Module):
         return torch.transpose(x, 0, 1)
 
 
-@register_test_case(module_factory=lambda: TransposeIntModule())
-def TransposeIntModule_basic(module, tu: TestUtils):
+@register_test_case(module_factory=lambda: AdjointRealModule())
+def AdjointRealModule_basic(module, tu: TestUtils):
     module.forward(tu.rand(3, 4, 2))
 
 
